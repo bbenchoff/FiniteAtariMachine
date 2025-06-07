@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Atari ROM Collection Analyzer
-Analyze all real Atari 2600 ROMs to calibrate our heuristics.
+Fixed Atari ROM Collection Analyzer
+Proper memory mapping analysis for TIA and RIOT
 """
 
 import os
 import struct
 import glob
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 from dataclasses import dataclass
 import statistics
+from collections import Counter, defaultdict
 
-# Copy the same constants and functions from the generator
+# 6502 instruction analysis
 VALID_OPCODES = {
     0x00, 0x01, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0D, 0x0E, 0x10, 0x11, 0x15, 0x16, 0x18,
     0x19, 0x1D, 0x1E, 0x20, 0x21, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E,
@@ -27,78 +28,221 @@ VALID_OPCODES = {
     0xEC, 0xED, 0xEE, 0xF0, 0xF1, 0xF5, 0xF6, 0xF8, 0xF9, 0xFD, 0xFE
 }
 
-BRANCH_OPCODES = {0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0}
-JUMP_OPCODES = {0x4C, 0x6C, 0x20}
-
+# TIA registers (only the low byte matters due to mirroring)
 TIA_REGISTERS = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
-    0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23,
-    0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F
+    # Write registers
+    0x00: 'VSYNC', 0x01: 'VBLANK', 0x02: 'WSYNC', 0x03: 'RSYNC',
+    0x04: 'NUSIZ0', 0x05: 'NUSIZ1', 0x06: 'COLUP0', 0x07: 'COLUP1',
+    0x08: 'COLUPF', 0x09: 'COLUBK', 0x0A: 'CTRLPF', 0x0B: 'REFP0',
+    0x0C: 'REFP1', 0x0D: 'PF0', 0x0E: 'PF1', 0x0F: 'PF2',
+    0x10: 'RESP0', 0x11: 'RESP1', 0x12: 'RESM0', 0x13: 'RESM1',
+    0x14: 'RESBL', 0x15: 'AUDC0', 0x16: 'AUDC1', 0x17: 'AUDF0',
+    0x18: 'AUDF1', 0x19: 'AUDV0', 0x1A: 'AUDV1', 0x1B: 'GRP0',
+    0x1C: 'GRP1', 0x1D: 'ENAM0', 0x1E: 'ENAM1', 0x1F: 'ENABL',
+    0x20: 'HMP0', 0x21: 'HMP1', 0x22: 'HMM0', 0x23: 'HMM1',
+    0x24: 'HMBL', 0x25: 'VDELP0', 0x26: 'VDELP1', 0x27: 'VDELBL',
+    0x28: 'RESMP0', 0x29: 'RESMP1', 0x2A: 'HMOVE', 0x2B: 'HMCLR',
+    0x2C: 'CXCLR', 0x2D: 'CXCLR', 0x2E: 'CXCLR', 0x2F: 'CXCLR'
 }
 
-RIOT_REGISTERS = {0x280, 0x281, 0x282, 0x283, 0x284, 0x285, 0x286, 0x287,
-                  0x294, 0x295, 0x296, 0x297}
+# RIOT register ranges (low byte only due to mirroring)
+# Timer registers: $x80-$x87 (where x can be 0,1,2,3...)  
+# I/O registers: $x94-$x97
+RIOT_TIMER_RANGE = range(0x80, 0x88)      # 0x80-0x87
+RIOT_IO_RANGE = range(0x94, 0x98)         # 0x94-0x97
+
+# All instructions that can read/write memory
+MEMORY_INSTRUCTIONS = {
+    # Store instructions
+    0x85: ('STA', 'zp', 2),      # STA zero page
+    0x8D: ('STA', 'abs', 3),     # STA absolute  
+    0x95: ('STA', 'zp,X', 2),    # STA zero page,X
+    0x9D: ('STA', 'abs,X', 3),   # STA absolute,X
+    0x99: ('STA', 'abs,Y', 3),   # STA absolute,Y
+    0x81: ('STA', '(zp,X)', 2),  # STA (zero page,X)
+    0x91: ('STA', '(zp),Y', 2),  # STA (zero page),Y
+    
+    0x86: ('STX', 'zp', 2),      # STX zero page
+    0x8E: ('STX', 'abs', 3),     # STX absolute
+    0x96: ('STX', 'zp,Y', 2),    # STX zero page,Y
+    
+    0x84: ('STY', 'zp', 2),      # STY zero page  
+    0x8C: ('STY', 'abs', 3),     # STY absolute
+    0x94: ('STY', 'zp,X', 2),    # STY zero page,X
+    
+    # Load instructions  
+    0xA5: ('LDA', 'zp', 2),      # LDA zero page
+    0xAD: ('LDA', 'abs', 3),     # LDA absolute
+    0xB5: ('LDA', 'zp,X', 2),    # LDA zero page,X
+    0xBD: ('LDA', 'abs,X', 3),   # LDA absolute,X
+    0xB9: ('LDA', 'abs,Y', 3),   # LDA absolute,Y
+    0xA1: ('LDA', '(zp,X)', 2),  # LDA (zero page,X)
+    0xB1: ('LDA', '(zp),Y', 2),  # LDA (zero page),Y
+    
+    0xA6: ('LDX', 'zp', 2),      # LDX zero page
+    0xAE: ('LDX', 'abs', 3),     # LDX absolute  
+    0xB6: ('LDX', 'zp,Y', 2),    # LDX zero page,Y
+    0xBE: ('LDX', 'abs,Y', 3),   # LDX absolute,Y
+    
+    0xA4: ('LDY', 'zp', 2),      # LDY zero page
+    0xAC: ('LDY', 'abs', 3),     # LDY absolute
+    0xB4: ('LDY', 'zp,X', 2),    # LDY zero page,X  
+    0xBC: ('LDY', 'abs,X', 3),   # LDY absolute,X
+}
+
+def is_tia_address(addr: int) -> bool:
+    """Check if address maps to TIA (considering mirroring)"""
+    # TIA appears at $00-$2F in zero page, and mirrors throughout address space
+    return (addr & 0xFF) <= 0x2F
+
+def is_riot_address(addr: int) -> bool:
+    """Check if address maps to RIOT (considering mirroring)"""
+    low_byte = addr & 0xFF
+    return low_byte in RIOT_TIMER_RANGE or low_byte in RIOT_IO_RANGE
+
+def get_riot_type(addr: int) -> str:
+    """Determine if RIOT access is timer or I/O"""
+    low_byte = addr & 0xFF
+    if low_byte in RIOT_TIMER_RANGE:
+        return "TIMER"
+    elif low_byte in RIOT_IO_RANGE:
+        return "IO"
+    return "UNKNOWN"
+
+@dataclass
+class MemoryAccess:
+    """Memory access information"""
+    pc: int
+    instruction: str
+    addressing_mode: str
+    target_address: int
+    access_type: str  # 'TIA', 'RIOT_TIMER', 'RIOT_IO', 'OTHER'
+    is_read: bool
+    context_bytes: bytes
 
 @dataclass
 class ROMAnalysis:
     filename: str
     size: int
     valid_opcodes_ratio: float
-    tia_accesses: int
-    riot_accesses: int
+    tia_accesses: List[MemoryAccess]
+    riot_accesses: List[MemoryAccess]
+    tia_access_count: int
+    riot_access_count: int
+    riot_timer_count: int
+    riot_io_count: int
     branch_instructions: int
     jump_instructions: int
     unique_opcodes: int
-    has_loop_patterns: bool
-    has_valid_reset_vector: bool
     score: float
 
-def analyze_rom_file(filepath: Path) -> ROMAnalysis:
-    """Analyze a single ROM file"""
+def analyze_memory_accesses(rom_data: bytes) -> Tuple[List[MemoryAccess], List[MemoryAccess]]:
+    """Analyze all memory accesses in ROM"""
+    tia_accesses = []
+    riot_accesses = []
+    
+    i = 0
+    while i < len(rom_data):
+        if rom_data[i] in MEMORY_INSTRUCTIONS:
+            inst_name, addr_mode, inst_len = MEMORY_INSTRUCTIONS[rom_data[i]]
+            
+            if i + inst_len <= len(rom_data):
+                target_addr = None
+                
+                # Decode target address based on addressing mode
+                if addr_mode == 'zp':
+                    target_addr = rom_data[i + 1]
+                elif addr_mode == 'abs':
+                    target_addr = struct.unpack('<H', rom_data[i+1:i+3])[0]
+                elif addr_mode in ['zp,X', 'zp,Y']:
+                    # For indexed zero page, base address could hit TIA/RIOT with index
+                    base_addr = rom_data[i + 1] 
+                    target_addr = base_addr  # We'll check if base could hit target
+                elif addr_mode in ['abs,X', 'abs,Y']:
+                    base_addr = struct.unpack('<H', rom_data[i+1:i+3])[0]
+                    target_addr = base_addr
+                # Skip indirect addressing for now (complex to analyze)
+                
+                if target_addr is not None:
+                    # Get context
+                    context_start = max(0, i - 3)
+                    context_end = min(len(rom_data), i + inst_len + 3)
+                    context = rom_data[context_start:context_end]
+                    
+                    is_read = inst_name.startswith('LD')
+                    
+                    access = MemoryAccess(
+                        pc=i,
+                        instruction=inst_name,
+                        addressing_mode=addr_mode,
+                        target_address=target_addr,
+                        access_type='OTHER',
+                        is_read=is_read,
+                        context_bytes=context
+                    )
+                    
+                    # Classify the access
+                    if is_tia_address(target_addr):
+                        access.access_type = 'TIA'
+                        tia_accesses.append(access)
+                    elif is_riot_address(target_addr):
+                        riot_type = get_riot_type(target_addr)
+                        access.access_type = f'RIOT_{riot_type}'
+                        riot_accesses.append(access)
+        
+        i += 1
+    
+    return tia_accesses, riot_accesses
+
+def analyze_rom_file_fixed(filepath: Path) -> ROMAnalysis:
+    """Fixed analysis of ROM with proper memory mapping"""
     try:
         with open(filepath, 'rb') as f:
             rom_data = f.read()
         
-        # Handle different ROM sizes (some are 2K, 4K, 8K, etc.)
         if len(rom_data) < 2:
             return None
             
         size = len(rom_data)
         
-        # Calculate metrics
-        opcode_ratio = check_opcode_sanity(rom_data)
-        tia_count = count_tia_accesses(rom_data)
-        riot_count = count_riot_accesses(rom_data)
-        branch_count = count_branches(rom_data)
-        jump_count = count_jumps(rom_data)
-        unique_ops = count_unique_opcodes(rom_data)
-        has_loops = detect_loop_patterns(rom_data)
-        valid_reset = check_reset_vector(rom_data)
+        # Basic metrics
+        opcode_ratio = sum(1 for byte in rom_data if byte in VALID_OPCODES) / len(rom_data)
         
-        # Use same scoring as generator
+        # Memory access analysis
+        tia_accesses, riot_accesses = analyze_memory_accesses(rom_data)
+        
+        # Classify RIOT accesses
+        riot_timer_count = sum(1 for acc in riot_accesses if acc.access_type == 'RIOT_TIMER')
+        riot_io_count = sum(1 for acc in riot_accesses if acc.access_type == 'RIOT_IO')
+        
+        # Other metrics
+        branch_count = sum(1 for byte in rom_data if byte in {0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0})
+        jump_count = sum(1 for byte in rom_data if byte in {0x4C, 0x6C, 0x20})
+        unique_ops = len(set(byte for byte in rom_data if byte in VALID_OPCODES))
+        
+        # Calculate score
         score = (
             opcode_ratio * 0.25 +
-            min(tia_count / 20.0, 1.0) * 0.20 +
-            min(riot_count / 10.0, 1.0) * 0.15 +
-            min(branch_count / 15.0, 1.0) * 0.15 +
-            min(jump_count / 8.0, 1.0) * 0.10 +
-            min(unique_ops / 30.0, 1.0) * 0.10 +
-            (0.05 if has_loops else 0.0) +
-            (0.05 if valid_reset else 0.0)
+            min(len(tia_accesses) / 50.0, 1.0) * 0.30 +
+            min(len(riot_accesses) / 10.0, 1.0) * 0.15 +
+            min(branch_count / 100.0, 1.0) * 0.15 +
+            min(jump_count / 20.0, 1.0) * 0.10 +
+            min(unique_ops / 50.0, 1.0) * 0.05
         )
         
         return ROMAnalysis(
             filename=filepath.name,
             size=size,
             valid_opcodes_ratio=opcode_ratio,
-            tia_accesses=tia_count,
-            riot_accesses=riot_count,
+            tia_accesses=tia_accesses,
+            riot_accesses=riot_accesses,
+            tia_access_count=len(tia_accesses),
+            riot_access_count=len(riot_accesses),
+            riot_timer_count=riot_timer_count,
+            riot_io_count=riot_io_count,
             branch_instructions=branch_count,
             jump_instructions=jump_count,
             unique_opcodes=unique_ops,
-            has_loop_patterns=has_loops,
-            has_valid_reset_vector=valid_reset,
             score=score
         )
         
@@ -106,258 +250,98 @@ def analyze_rom_file(filepath: Path) -> ROMAnalysis:
         print(f"Error analyzing {filepath}: {e}")
         return None
 
-def check_opcode_sanity(rom_data: bytes) -> float:
-    """Check what percentage of bytes are valid 6502 opcodes"""
-    if not rom_data:
-        return 0.0
-    valid_count = sum(1 for byte in rom_data if byte in VALID_OPCODES)
-    return valid_count / len(rom_data)
-
-def count_tia_accesses(rom_data: bytes) -> int:
-    """Count potential TIA register accesses"""
-    count = 0
-    for i in range(len(rom_data) - 2):
-        # STA absolute
-        if rom_data[i] == 0x8D and i + 2 < len(rom_data):
-            addr = struct.unpack('<H', rom_data[i+1:i+3])[0]
-            if (addr & 0xFF) in TIA_REGISTERS:
-                count += 1
-        # STA zero page
-        elif rom_data[i] == 0x85 and i + 1 < len(rom_data):
-            if rom_data[i+1] in TIA_REGISTERS:
-                count += 1
-    return count
-
-def count_riot_accesses(rom_data: bytes) -> int:
-    """Count potential RIOT register accesses"""
-    count = 0
-    for i in range(len(rom_data) - 2):
-        if rom_data[i] == 0x8D and i + 2 < len(rom_data):
-            addr = struct.unpack('<H', rom_data[i+1:i+3])[0]
-            if addr in RIOT_REGISTERS:
-                count += 1
-    return count
-
-def count_branches(rom_data: bytes) -> int:
-    """Count branch instructions"""
-    return sum(1 for byte in rom_data if byte in BRANCH_OPCODES)
-
-def count_jumps(rom_data: bytes) -> int:
-    """Count jump/call instructions"""
-    return sum(1 for byte in rom_data if byte in JUMP_OPCODES)
-
-def count_unique_opcodes(rom_data: bytes) -> int:
-    """Count number of unique valid opcodes used"""
-    used_opcodes = set()
-    for byte in rom_data:
-        if byte in VALID_OPCODES:
-            used_opcodes.add(byte)
-    return len(used_opcodes)
-
-def detect_loop_patterns(rom_data: bytes) -> bool:
-    """Look for potential loop patterns (branch backwards)"""
-    for i in range(len(rom_data) - 1):
-        if rom_data[i] in BRANCH_OPCODES and i + 1 < len(rom_data):
-            offset = struct.unpack('b', bytes([rom_data[i+1]]))[0]
-            if offset < 0:
-                return True
-    return False
-
-def check_reset_vector(rom_data: bytes) -> bool:
-    """Check if the reset vector points to valid ROM space"""
-    if len(rom_data) < 2:
-        return False
+def print_fixed_analysis(analyses: List[ROMAnalysis]):
+    """Print corrected analysis results"""
     
-    # Different ROM sizes have different address spaces
-    reset_addr = struct.unpack('<H', rom_data[-2:])[0]
+    print(f"\n🔧 FIXED ATARI 2600 MEMORY ANALYSIS")
+    print("=" * 80)
+    print("Now properly handling mirrored memory mapping!")
     
-    # Common Atari 2600 ROM mappings
-    if len(rom_data) == 4096:  # 4K ROM
-        return 0xF000 <= reset_addr <= 0xFFFF
-    elif len(rom_data) == 2048:  # 2K ROM  
-        return 0xF800 <= reset_addr <= 0xFFFF
-    elif len(rom_data) == 8192:  # 8K ROM
-        return 0xE000 <= reset_addr <= 0xFFFF
-    else:
-        # Generic check - high byte should be reasonable
-        return reset_addr >= 0xE000
-
-def print_statistics(analyses: List[ROMAnalysis]):
-    """Print detailed statistics about the ROM collection"""
+    # TIA Analysis
+    all_tia = []
+    for rom in analyses:
+        all_tia.extend(rom.tia_accesses)
     
-    if not analyses:
-        print("No valid ROMs analyzed!")
-        return
+    print(f"\n🎮 TIA Analysis:")
+    print(f"  Total TIA accesses: {len(all_tia):,}")
     
-    print(f"\n📊 Analysis of {len(analyses)} Atari 2600 ROMs")
-    print("=" * 60)
+    # TIA by instruction
+    tia_by_inst = Counter(acc.instruction for acc in all_tia)
+    print(f"  Instructions:")
+    for inst, count in tia_by_inst.most_common():
+        pct = count / len(all_tia) * 100
+        print(f"    {inst}: {count:,} ({pct:.1f}%)")
     
-    # Size distribution
-    sizes = [rom.size for rom in analyses]
-    print(f"\n📏 ROM Sizes:")
-    print(f"  Min: {min(sizes):,} bytes")
-    print(f"  Max: {max(sizes):,} bytes") 
-    print(f"  Most common: {statistics.mode(sizes):,} bytes")
+    # TIA by addressing mode
+    tia_by_mode = Counter(acc.addressing_mode for acc in all_tia)
+    print(f"  Addressing modes:")
+    for mode, count in tia_by_mode.most_common():
+        pct = count / len(all_tia) * 100
+        print(f"    {mode}: {count:,} ({pct:.1f}%)")
     
-    # Helper function to print percentiles
-    def print_metric_stats(name: str, values: list, is_percentage: bool = False):
-        sorted_vals = sorted(values)
-        n = len(sorted_vals)
-        
-        p5 = sorted_vals[int(n * 0.05)]
-        p10 = sorted_vals[int(n * 0.10)]
-        p25 = sorted_vals[int(n * 0.25)]
-        p50 = statistics.median(values)
-        p75 = sorted_vals[int(n * 0.75)]
-        p90 = sorted_vals[int(n * 0.90)]
-        p95 = sorted_vals[int(n * 0.95)]
-        
-        print(f"\n{name}:")
-        print(f"  Min: {min(values):.3f}" + (f" ({min(values)*100:.1f}%)" if is_percentage else ""))
-        print(f"  5th percentile: {p5:.3f}" + (f" ({p5*100:.1f}%)" if is_percentage else ""))
-        print(f"  10th percentile: {p10:.3f}" + (f" ({p10*100:.1f}%)" if is_percentage else ""))
-        print(f"  25th percentile: {p25:.3f}" + (f" ({p25*100:.1f}%)" if is_percentage else ""))
-        print(f"  Median (50th): {p50:.3f}" + (f" ({p50*100:.1f}%)" if is_percentage else ""))
-        print(f"  75th percentile: {p75:.3f}" + (f" ({p75*100:.1f}%)" if is_percentage else ""))
-        print(f"  90th percentile: {p90:.3f}" + (f" ({p90*100:.1f}%)" if is_percentage else ""))
-        print(f"  95th percentile: {p95:.3f}" + (f" ({p95*100:.1f}%)" if is_percentage else ""))
-        print(f"  Max: {max(values):.3f}" + (f" ({max(values)*100:.1f}%)" if is_percentage else ""))
-        print(f"  Mean: {statistics.mean(values):.3f}" + (f" ({statistics.mean(values)*100:.1f}%)" if is_percentage else ""))
+    # RIOT Analysis  
+    all_riot = []
+    for rom in analyses:
+        all_riot.extend(rom.riot_accesses)
     
-    # Detailed percentile analysis for each metric
-    opcodes = [rom.valid_opcodes_ratio for rom in analyses]
-    print_metric_stats("🔧 Valid Opcode Ratios", opcodes, is_percentage=True)
+    print(f"\n🕹️ RIOT Analysis:")
+    print(f"  Total RIOT accesses: {len(all_riot):,}")
     
-    tia_counts = [rom.tia_accesses for rom in analyses]
-    print_metric_stats("🎮 TIA Accesses", tia_counts)
+    # RIOT by type
+    riot_by_type = Counter(acc.access_type for acc in all_riot)
+    print(f"  Access types:")
+    for riot_type, count in riot_by_type.most_common():
+        pct = count / len(all_riot) * 100 if all_riot else 0
+        print(f"    {riot_type}: {count:,} ({pct:.1f}%)")
     
-    riot_counts = [rom.riot_accesses for rom in analyses]
-    print_metric_stats("🕹️ RIOT Accesses", riot_counts)
+    # RIOT by instruction
+    riot_by_inst = Counter(acc.instruction for acc in all_riot)
+    print(f"  Instructions:")
+    for inst, count in riot_by_inst.most_common():
+        pct = count / len(all_riot) * 100 if all_riot else 0
+        print(f"    {inst}: {count:,} ({pct:.1f}%)")
     
-    branches = [rom.branch_instructions for rom in analyses]
-    print_metric_stats("🔀 Branch Instructions", branches)
+    # Statistics
+    tia_counts = [rom.tia_access_count for rom in analyses]
+    riot_counts = [rom.riot_access_count for rom in analyses]
     
-    jumps = [rom.jump_instructions for rom in analyses]
-    print_metric_stats("🦘 Jump Instructions", jumps)
+    print(f"\n📊 Statistics:")
+    print(f"  TIA accesses per ROM:")
+    print(f"    Min: {min(tia_counts)}, Max: {max(tia_counts)}")
+    print(f"    Mean: {statistics.mean(tia_counts):.1f}, Median: {statistics.median(tia_counts):.1f}")
     
-    unique = [rom.unique_opcodes for rom in analyses]
-    print_metric_stats("🎯 Unique Opcodes", unique)
+    print(f"  RIOT accesses per ROM:")
+    print(f"    Min: {min(riot_counts)}, Max: {max(riot_counts)}")
+    print(f"    Mean: {statistics.mean(riot_counts):.1f}, Median: {statistics.median(riot_counts):.1f}")
     
-    scores = [rom.score for rom in analyses]
-    print_metric_stats("🏆 Overall Scores", scores)
-    
-    # Loop patterns
-    loops = sum(1 for rom in analyses if rom.has_loop_patterns)
-    print(f"\n🔄 Loop Patterns: {loops}/{len(analyses)} ({loops/len(analyses)*100:.1f}%)")
-    
-    # Reset vectors
-    vectors = sum(1 for rom in analyses if rom.has_valid_reset_vector)
-    print(f"\n🎯 Valid Reset Vectors: {vectors}/{len(analyses)} ({vectors/len(analyses)*100:.1f}%)")
-    
-    # SUGGESTED THRESHOLDS FOR RANDOM ROM GENERATION
-    print(f"\n" + "="*80)
-    print(f"💡 SUGGESTED THRESHOLDS FOR RANDOM ROM GENERATION")
-    print(f"="*80)
-    
-    # Use 5th-10th percentiles as thresholds (bottom 5-10% of real games)
-    sorted_opcodes = sorted(opcodes)
+    # Thresholds
     sorted_tia = sorted(tia_counts)
     sorted_riot = sorted(riot_counts)
-    sorted_branches = sorted(branches)
-    sorted_jumps = sorted(jumps)
-    sorted_unique = sorted(unique)
-    sorted_scores = sorted(scores)
-    
     n = len(analyses)
     
-    # 5th percentile thresholds (very achievable)
-    print(f"\n🟢 EASY Thresholds (5th percentile - bottom 5% of real games):")
-    print(f"  OPCODE_THRESHOLD = {sorted_opcodes[int(n * 0.05)]:.2f}")
-    print(f"  TIA_THRESHOLD = {sorted_tia[int(n * 0.05)]}")
-    print(f"  RIOT_THRESHOLD = {sorted_riot[int(n * 0.05)]}")
-    print(f"  BRANCH_THRESHOLD = {sorted_branches[int(n * 0.05)]}")
-    print(f"  JUMP_THRESHOLD = {sorted_jumps[int(n * 0.05)]}")
-    print(f"  INSTRUCTION_VARIETY = {sorted_unique[int(n * 0.05)]}")
-    print(f"  MIN_SCORE = {sorted_scores[int(n * 0.05)]:.2f}")
+    print(f"\n🎯 CORRECTED Thresholds:")
+    print(f"  TIA Accesses:")
+    print(f"    5th percentile: {sorted_tia[int(n * 0.05)]} (EASY)")
+    print(f"    10th percentile: {sorted_tia[int(n * 0.10)]} (MEDIUM)")
+    print(f"    25th percentile: {sorted_tia[int(n * 0.25)]} (HARD)")
     
-    # 10th percentile thresholds (still achievable)
-    print(f"\n🟡 MEDIUM Thresholds (10th percentile - bottom 10% of real games):")
-    print(f"  OPCODE_THRESHOLD = {sorted_opcodes[int(n * 0.10)]:.2f}")
-    print(f"  TIA_THRESHOLD = {sorted_tia[int(n * 0.10)]}")
-    print(f"  RIOT_THRESHOLD = {sorted_riot[int(n * 0.10)]}")
-    print(f"  BRANCH_THRESHOLD = {sorted_branches[int(n * 0.10)]}")
-    print(f"  JUMP_THRESHOLD = {sorted_jumps[int(n * 0.10)]}")
-    print(f"  INSTRUCTION_VARIETY = {sorted_unique[int(n * 0.10)]}")
-    print(f"  MIN_SCORE = {sorted_scores[int(n * 0.10)]:.2f}")
+    print(f"  RIOT Accesses:")
+    print(f"    5th percentile: {sorted_riot[int(n * 0.05)]} (EASY)")
+    print(f"    10th percentile: {sorted_riot[int(n * 0.10)]} (MEDIUM)")  
+    print(f"    25th percentile: {sorted_riot[int(n * 0.25)]} (HARD)")
     
-    # 25th percentile thresholds (more selective)
-    print(f"\n🟠 HARD Thresholds (25th percentile - bottom 25% of real games):")
-    print(f"  OPCODE_THRESHOLD = {sorted_opcodes[int(n * 0.25)]:.2f}")
-    print(f"  TIA_THRESHOLD = {sorted_tia[int(n * 0.25)]}")
-    print(f"  RIOT_THRESHOLD = {sorted_riot[int(n * 0.25)]}")
-    print(f"  BRANCH_THRESHOLD = {sorted_branches[int(n * 0.25)]}")
-    print(f"  JUMP_THRESHOLD = {sorted_jumps[int(n * 0.25)]}")
-    print(f"  INSTRUCTION_VARIETY = {sorted_unique[int(n * 0.25)]}")
-    print(f"  MIN_SCORE = {sorted_scores[int(n * 0.25)]:.2f}")
-    
-    print(f"\n💭 Recommendation: Start with EASY thresholds, then move up if you find too many.")
-    
-    # Current thresholds analysis (keep this)
-    print(f"\n🚨 Current Generator Threshold Analysis:")
-    current_thresholds = {
-        'opcodes': 0.70,
-        'tia': 50,
-        'riot': 1, 
-        'branches': 100,
-        'jumps': 25,
-        'unique': 50,
-        'score': 0.75
-    }
-    
-    passing_opcodes = sum(1 for rom in analyses if rom.valid_opcodes_ratio >= current_thresholds['opcodes'])
-    passing_tia = sum(1 for rom in analyses if rom.tia_accesses >= current_thresholds['tia'])
-    passing_riot = sum(1 for rom in analyses if rom.riot_accesses >= current_thresholds['riot'])
-    passing_branches = sum(1 for rom in analyses if rom.branch_instructions >= current_thresholds['branches'])
-    passing_jumps = sum(1 for rom in analyses if rom.jump_instructions >= current_thresholds['jumps'])
-    passing_unique = sum(1 for rom in analyses if rom.unique_opcodes >= current_thresholds['unique'])
-    passing_score = sum(1 for rom in analyses if rom.score >= current_thresholds['score'])
-    
-    print(f"  Opcodes ≥70%: {passing_opcodes}/{len(analyses)} ({passing_opcodes/len(analyses)*100:.1f}%)")
-    print(f"  TIA ≥50: {passing_tia}/{len(analyses)} ({passing_tia/len(analyses)*100:.1f}%)")
-    print(f"  RIOT ≥1: {passing_riot}/{len(analyses)} ({passing_riot/len(analyses)*100:.1f}%)")
-    print(f"  Branches ≥100: {passing_branches}/{len(analyses)} ({passing_branches/len(analyses)*100:.1f}%)")
-    print(f"  Jumps ≥25: {passing_jumps}/{len(analyses)} ({passing_jumps/len(analyses)*100:.1f}%)")
-    print(f"  Unique ≥50: {passing_unique}/{len(analyses)} ({passing_unique/len(analyses)*100:.1f}%)")
-    print(f"  Score ≥0.75: {passing_score}/{len(analyses)} ({passing_score/len(analyses)*100:.1f}%)")
-    
-    # ALL thresholds
-    passing_all = sum(1 for rom in analyses if (
-        rom.valid_opcodes_ratio >= current_thresholds['opcodes'] and
-        rom.tia_accesses >= current_thresholds['tia'] and
-        rom.riot_accesses >= current_thresholds['riot'] and
-        rom.branch_instructions >= current_thresholds['branches'] and
-        rom.jump_instructions >= current_thresholds['jumps'] and
-        rom.unique_opcodes >= current_thresholds['unique'] and
-        rom.score >= current_thresholds['score']
-    ))
-    
-    print(f"\n💎 ROMs passing ALL current thresholds: {passing_all}/{len(analyses)} ({passing_all/len(analyses)*100:.3f}%)")
-    
-    if passing_all < len(analyses) * 0.05:  # Less than 5% pass
-        print("❌ CURRENT THRESHOLDS ARE TOO HARSH!")
-        print("   Consider using the EASY or MEDIUM suggested thresholds above.")
-    elif passing_all > len(analyses) * 0.5:  # More than 50% pass
-        print("⚠️  CURRENT THRESHOLDS MIGHT BE TOO EASY!")
-        print("   Consider using HARD thresholds for more selectivity.")
-    else:
-        print("✅ Current thresholds look reasonable!")
+    # Show some examples
+    print(f"\n🔍 Examples of games with high RIOT usage:")
+    high_riot_games = sorted(analyses, key=lambda x: x.riot_access_count, reverse=True)[:5]
+    for rom in high_riot_games:
+        print(f"  {rom.filename}: {rom.riot_access_count} RIOT accesses "
+              f"({rom.riot_timer_count} timer, {rom.riot_io_count} I/O)")
 
 def main():
     import sys
     
     if len(sys.argv) != 2:
-        print("Usage: python3 rom_calibrator.py <directory_with_roms>")
-        print("Example: python3 rom_calibrator.py ./atari_roms/")
+        print("Usage: python3 fixed_analyzer.py <directory_with_roms>")
         sys.exit(1)
     
     rom_dir = Path(sys.argv[1])
@@ -366,39 +350,36 @@ def main():
         print(f"Directory {rom_dir} does not exist!")
         sys.exit(1)
     
-    # Find all .bin files
     rom_files = list(rom_dir.glob("*.bin")) + list(rom_dir.glob("*.BIN"))
     
     if not rom_files:
         print(f"No .bin files found in {rom_dir}")
         sys.exit(1)
     
-    print(f"🔍 Found {len(rom_files)} ROM files")
-    print("Analyzing...")
+    print(f"🔍 Analyzing {len(rom_files)} ROM files with FIXED memory mapping...")
     
     analyses = []
     for i, rom_file in enumerate(rom_files):
         if i % 50 == 0:
             print(f"  Processed {i}/{len(rom_files)} ROMs...")
         
-        analysis = analyze_rom_file(rom_file)
+        analysis = analyze_rom_file_fixed(rom_file)
         if analysis:
             analyses.append(analysis)
     
     print(f"✅ Successfully analyzed {len(analyses)} ROMs")
     
-    print_statistics(analyses)
+    print_fixed_analysis(analyses)
     
-    # Save detailed results
-    with open("rom_analysis_results.txt", "w") as f:
-        f.write("Filename,Size,Opcodes,TIA,RIOT,Branches,Jumps,Unique,Loops,ResetVector,Score\n")
+    # Save corrected results
+    with open("fixed_memory_analysis.csv", "w") as f:
+        f.write("ROM,TIA_Count,RIOT_Count,RIOT_Timer,RIOT_IO,Branches,Jumps,Opcodes,Score\n")
         for rom in analyses:
-            f.write(f"{rom.filename},{rom.size},{rom.valid_opcodes_ratio:.4f},"
-                   f"{rom.tia_accesses},{rom.riot_accesses},{rom.branch_instructions},"
-                   f"{rom.jump_instructions},{rom.unique_opcodes},{rom.has_loop_patterns},"
-                   f"{rom.has_valid_reset_vector},{rom.score:.4f}\n")
+            f.write(f"{rom.filename},{rom.tia_access_count},{rom.riot_access_count},"
+                   f"{rom.riot_timer_count},{rom.riot_io_count},{rom.branch_instructions},"
+                   f"{rom.jump_instructions},{rom.unique_opcodes},{rom.score:.4f}\n")
     
-    print(f"\n💾 Detailed results saved to 'rom_analysis_results.txt'")
+    print(f"\n💾 Fixed analysis saved to 'fixed_memory_analysis.csv'")
 
 if __name__ == "__main__":
     main()

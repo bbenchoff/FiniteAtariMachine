@@ -1,0 +1,37 @@
+{
+  "finite_atari_machine": {
+    "rom_id": 43,
+    "filename": "finite_atari_000043_score0.527_op58_tia51_riot14.bin",
+    "generated_timestamp": 1749326146.8227978,
+    "generator_version": "corrected_blog_post_v1.0"
+  },
+  "analysis_results": {
+    "overall_score": 0.5270501902103424,
+    "opcode_ratio": 0.5872007608413696,
+    "opcode_percentage": 58.72007608413696,
+    "tia_accesses": 51,
+    "riot_accesses": 14,
+    "branch_instructions": 163,
+    "jump_instructions": 44,
+    "unique_opcodes_estimate": 129
+  },
+  "threshold_comparison": {
+    "opcode_threshold": 0.58,
+    "tia_threshold": 50,
+    "riot_threshold": 13,
+    "branch_threshold": 150,
+    "jump_threshold": 37,
+    "variety_threshold": 100,
+    "min_score": 0.52
+  },
+  "percentile_basis": {
+    "note": "Thresholds based on 5th percentile of 1,530 real Atari 2600 games",
+    "source": "Atari 2600 Full ROM Collection analysis",
+    "memory_mapping": "Corrected for proper TIA/RIOT mirroring"
+  },
+  "patterns_detected": {
+    "tia_analysis": "Zero page addressing (82.1% expected), absolute addressing (4.7% expected)",
+    "riot_analysis": "Timer access ($80-$87, 78% expected), I/O access ($94-$97, 22% expected)",
+    "instruction_distribution": "STA 71.8%, STX 9.3%, STY 8.5%, LDA 6.7% expected for TIA"
+  }
+}

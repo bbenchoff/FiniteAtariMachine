@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-CUDA Atari ROM Generator using CuPy
-Much more reliable than raw CUDA on Windows
+CUDA Atari ROM Generator - FIXED VERSION
 """
 
 import cupy as cp
 import numpy as np
 import time
-import os
 from pathlib import Path
 
 # Constants
 ROM_SIZE = 4094
-BATCH_SIZE = 1024 * 256  # 256K ROMs per batch
-OPCODE_THRESHOLD = 0.66
-TIA_THRESHOLD = 51
-RIOT_THRESHOLD = 1
-BRANCH_THRESHOLD = 177
-JUMP_THRESHOLD = 37
-INSTRUCTION_VARIETY = 125
-MIN_SCORE = 0.80
+BATCH_SIZE = 1024 * 256
 
-# Valid opcodes
+# Discovery thresholds based on observed patterns
+OPCODE_THRESHOLD = 0.58
+TIA_THRESHOLD = 50
+RIOT_THRESHOLD = 13
+BRANCH_THRESHOLD = 150
+JUMP_THRESHOLD = 37
+INSTRUCTION_VARIETY = 100
+MIN_SCORE = 0.52
+
+# Valid 6502 opcodes (151 total)
 VALID_OPCODES = np.array([
     0x00, 0x01, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0D, 0x0E, 0x10, 0x11, 0x15, 0x16, 0x18,
     0x19, 0x1D, 0x1E, 0x20, 0x21, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E,
@@ -36,87 +36,123 @@ VALID_OPCODES = np.array([
     0xEC, 0xED, 0xEE, 0xF0, 0xF1, 0xF5, 0xF6, 0xF8, 0xF9, 0xFD, 0xFE
 ], dtype=np.uint8)
 
+# Control flow opcodes
 BRANCH_OPCODES = np.array([0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0], dtype=np.uint8)
 JUMP_OPCODES = np.array([0x4C, 0x6C, 0x20], dtype=np.uint8)
-RIOT_REGISTERS = np.array([0x280, 0x281, 0x282, 0x283, 0x284, 0x285, 0x286, 0x287, 
-                          0x294, 0x295, 0x296, 0x297], dtype=np.uint16)
 
 def create_lookup_tables():
-    """Create GPU lookup tables for fast analysis"""
-    # Valid opcodes lookup
+    """Create GPU lookup tables for ROM analysis"""
     valid_lut = cp.zeros(256, dtype=cp.bool_)
     valid_lut[VALID_OPCODES] = True
     
-    # TIA registers (0x00-0x2F)
-    tia_lut = cp.zeros(256, dtype=cp.bool_)
-    tia_lut[0:0x30] = True
-    
-    # Branch opcodes lookup
     branch_lut = cp.zeros(256, dtype=cp.bool_)
     branch_lut[BRANCH_OPCODES] = True
     
-    # Jump opcodes lookup
     jump_lut = cp.zeros(256, dtype=cp.bool_)
     jump_lut[JUMP_OPCODES] = True
     
-    return valid_lut, tia_lut, branch_lut, jump_lut
+    # TIA instruction lookups
+    tia_store_lut = cp.zeros(256, dtype=cp.bool_)
+    tia_store_lut[[0x85, 0x86, 0x84, 0x95, 0x96, 0x94]] = True
+    
+    tia_load_lut = cp.zeros(256, dtype=cp.bool_)
+    tia_load_lut[[0xA5, 0xA6, 0xA4, 0xB5, 0xB6, 0xB4]] = True
+    
+    tia_abs_lut = cp.zeros(256, dtype=cp.bool_)
+    tia_abs_lut[[0x8D, 0x8E, 0x8C, 0xAD, 0xAE, 0xAC]] = True
+    
+    # RIOT instruction lookups
+    riot_access_lut = cp.zeros(256, dtype=cp.bool_)
+    riot_access_lut[[0x85, 0x86, 0x84, 0xA5, 0xA6, 0xA4]] = True
+    
+    # Address range masks
+    tia_range_mask = cp.arange(256, dtype=cp.uint8) <= 0x2F
+    riot_timer_mask = (cp.arange(256, dtype=cp.uint8) >= 0x80) & (cp.arange(256, dtype=cp.uint8) <= 0x87)
+    riot_io_mask = (cp.arange(256, dtype=cp.uint8) >= 0x94) & (cp.arange(256, dtype=cp.uint8) <= 0x97)
+    
+    return {
+        'valid': valid_lut,
+        'branch': branch_lut,
+        'jump': jump_lut,
+        'tia_store': tia_store_lut,
+        'tia_load': tia_load_lut,
+        'tia_abs': tia_abs_lut,
+        'riot_access': riot_access_lut,
+        'tia_range': tia_range_mask,
+        'riot_timer': riot_timer_mask,
+        'riot_io': riot_io_mask
+    }
 
-def analyze_roms_gpu(roms, valid_lut, tia_lut, branch_lut, jump_lut):
-    """Analyze a batch of ROMs on GPU using CuPy"""
+def analyze_roms(roms, lut):
+    """Analyze ROMs for game-like patterns"""
     batch_size = roms.shape[0]
     
-    # Count valid opcodes per ROM
-    valid_opcodes = cp.sum(valid_lut[roms], axis=1)
-    opcode_ratio = valid_opcodes / ROM_SIZE
+    # Opcode analysis
+    valid_opcodes_count = cp.sum(lut['valid'][roms], axis=1)
+    opcode_ratio = valid_opcodes_count.astype(cp.float32) / ROM_SIZE
     
-    # Count TIA accesses (STA instructions to TIA range)
-    # Look for STA absolute (0x8D) followed by TIA addresses
-    sta_abs_mask = (roms[:, :-2] == 0x8D)
-    sta_zp_mask = (roms[:, :-1] == 0x85)
+    # Control flow analysis
+    branch_count = cp.sum(lut['branch'][roms], axis=1)
+    jump_count = cp.sum(lut['jump'][roms], axis=1)
     
-    # For STA absolute, check if low byte is in TIA range
-    tia_abs_accesses = cp.sum(sta_abs_mask & tia_lut[roms[:, 1:-1]], axis=1)
+    # TIA analysis
+    tia_accesses = cp.zeros(batch_size, dtype=cp.int32)
     
-    # For STA zero page, check if address is in TIA range  
-    tia_zp_accesses = cp.sum(sta_zp_mask & tia_lut[roms[:, 1:]], axis=1)
+    # Zero page addressing
+    tia_store_zp = lut['tia_store'][roms[:, :-1]] & lut['tia_range'][roms[:, 1:]]
+    tia_load_zp = lut['tia_load'][roms[:, :-1]] & lut['tia_range'][roms[:, 1:]]
+    tia_zp_total = cp.sum(tia_store_zp | tia_load_zp, axis=1)
+    tia_accesses += tia_zp_total
     
-    tia_accesses = tia_abs_accesses + tia_zp_accesses
+    # Absolute addressing (any high byte due to mirroring)
+    tia_abs_positions = lut['tia_abs'][roms[:, :-2]]
+    tia_abs_targets = lut['tia_range'][roms[:, 1:-1]]  # Only check low byte for TIA range
+    tia_abs_total = cp.sum(tia_abs_positions & tia_abs_targets, axis=1)
+    tia_accesses += tia_abs_total
     
-    # Count RIOT accesses (simplified - just look for common patterns)
-    # This is a simplified version - real RIOT detection would be more complex
+    # RIOT analysis
     riot_accesses = cp.zeros(batch_size, dtype=cp.int32)
-    for riot_addr in RIOT_REGISTERS:
-        low_byte = riot_addr & 0xFF
-        high_byte = (riot_addr >> 8) & 0xFF
-        # Look for STA absolute to this address
-        addr_matches = sta_abs_mask & (roms[:, 1:-1] == low_byte) & (roms[:, 2:] == high_byte)
-        riot_accesses += cp.sum(addr_matches, axis=1)
     
-    # Count branches and jumps
-    branch_count = cp.sum(branch_lut[roms], axis=1)
-    jump_count = cp.sum(jump_lut[roms], axis=1)
+    # Timer access
+    riot_timer_positions = lut['riot_access'][roms[:, :-1]]
+    riot_timer_targets = lut['riot_timer'][roms[:, 1:]]
+    riot_timer_hits = cp.sum(riot_timer_positions & riot_timer_targets, axis=1)
+    riot_accesses += riot_timer_hits
     
-    # Count unique opcodes per ROM
+    # I/O access
+    riot_io_positions = lut['riot_access'][roms[:, :-1]]
+    riot_io_targets = lut['riot_io'][roms[:, 1:]]
+    riot_io_hits = cp.sum(riot_io_positions & riot_io_targets, axis=1)
+    riot_accesses += riot_io_hits
+    
+    # FIXED: Unique opcode counting in first 1KB (code section)
     unique_opcodes = cp.zeros(batch_size, dtype=cp.int32)
-    for i in range(batch_size):
-        unique_opcodes[i] = len(cp.unique(roms[i][valid_lut[roms[i]]]))
+    first_kb = roms[:, :1024]  # First 1KB where code typically resides
     
-    # Calculate composite score
-    scores = (opcode_ratio * 0.25 + 
-              cp.minimum(tia_accesses / 20.0, 1.0) * 0.20 +
-              cp.minimum(riot_accesses / 10.0, 1.0) * 0.15 +
-              cp.minimum(branch_count / 15.0, 1.0) * 0.15 +
-              cp.minimum(jump_count / 8.0, 1.0) * 0.10 +
-              cp.minimum(unique_opcodes / 30.0, 1.0) * 0.10)
+    # Count unique valid opcodes in the code section (FIXED - no duplication)
+    for opcode in VALID_OPCODES:
+        has_opcode = cp.any(first_kb == opcode, axis=1)
+        unique_opcodes += has_opcode.astype(cp.int32)
     
-    # Check if promising
-    promising = ((opcode_ratio >= OPCODE_THRESHOLD) &
-                (tia_accesses >= TIA_THRESHOLD) &
-                (riot_accesses >= RIOT_THRESHOLD) &
-                (branch_count >= BRANCH_THRESHOLD) &
-                (jump_count >= JUMP_THRESHOLD) &
-                (unique_opcodes >= INSTRUCTION_VARIETY) &
-                (scores >= MIN_SCORE))
+    # Composite score
+    scores = (
+        opcode_ratio * 0.25 + 
+        cp.minimum(tia_accesses / 150.0, 1.0) * 0.30 +
+        cp.minimum(riot_accesses / 50.0, 1.0) * 0.20 +
+        cp.minimum(branch_count / 200.0, 1.0) * 0.15 +
+        cp.minimum(jump_count / 40.0, 1.0) * 0.10
+    )
+    
+    # Promising ROM detection
+    promising = (
+        (opcode_ratio >= OPCODE_THRESHOLD) &
+        (tia_accesses >= TIA_THRESHOLD) &
+        (riot_accesses >= RIOT_THRESHOLD) &
+        (branch_count >= BRANCH_THRESHOLD) &
+        (jump_count >= JUMP_THRESHOLD) &
+        (unique_opcodes >= INSTRUCTION_VARIETY) &
+        (scores >= MIN_SCORE)
+    )
     
     return {
         'scores': scores,
@@ -129,106 +165,129 @@ def analyze_roms_gpu(roms, valid_lut, tia_lut, branch_lut, jump_lut):
         'promising': promising
     }
 
-def save_promising_rom(rom_data, analysis, rom_id, output_dir):
-    """Save a promising ROM to disk"""
-    score = float(analysis['scores'])
-    filename = f"base_{rom_id:06d}_score_{score:.3f}_cupy.bin"
+def save_promising_rom(rom_data, score, rom_id, output_dir):
+    """Save promising ROM with simple filename format: number_score_timestamp.bin"""
+    timestamp = int(time.time())
+    filename = f"{rom_id:06d}_{score:.3f}_{timestamp}.bin"
     filepath = output_dir / filename
     
-    # Save ROM
     with open(filepath, 'wb') as f:
         f.write(rom_data.tobytes())
     
-    # Save metadata
-    meta_filename = f"base_{rom_id:06d}_score_{score:.3f}_cupy.txt"
-    meta_filepath = output_dir / meta_filename
-    
-    with open(meta_filepath, 'w') as f:
-        f.write("ROM Base Analysis\n")
-        f.write("=================\n")
-        f.write("Generated with CuPy\n")
-        f.write(f"Overall Score: {score:.4f}\n")
-        f.write(f"Valid Opcodes: {float(analysis['opcode_ratio']):.3f} ({float(analysis['opcode_ratio'])*100:.1f}%)\n")
-        f.write(f"TIA Accesses: {int(analysis['tia_accesses'])}\n")
-        f.write(f"RIOT Accesses: {int(analysis['riot_accesses'])}\n")
-        f.write(f"Branch Instructions: {int(analysis['branch_count'])}\n")
-        f.write(f"Jump Instructions: {int(analysis['jump_count'])}\n")
-        f.write(f"Unique Opcodes: {int(analysis['unique_opcodes'])}\n")
-    
-    print(f"💎 SAVED: {filename}")
-    print(f"    Score: {score:.4f} | Opcodes: {float(analysis['opcode_ratio']):.3f} | "
-          f"TIA: {int(analysis['tia_accesses'])} | RIOT: {int(analysis['riot_accesses'])}")
+    return filename
 
 def main():
-    print("🕹️  Finite Atari Machine - CuPy Edition")
-    print("=" * 80)
-    print(f"Generating {BATCH_SIZE:,} ROMs per batch on GPU")
-    print(f"ROM size: {ROM_SIZE} bytes")
-    print("🟢 EASY Thresholds (5th percentile - bottom 5% of real games)")
-    print("Press Ctrl+C to stop")
-    print("=" * 80)
+    print("Finite Atari Machine - CUDA Generator")
+    print("=" * 60)
+    print(f"Batch size: {BATCH_SIZE:,} ROMs per batch")
+    print(f"ROM size: {ROM_SIZE:,} bytes")
+    print()
+    print("Thresholds:")
+    print(f"  Opcodes: {OPCODE_THRESHOLD:.1%}")
+    print(f"  TIA: {TIA_THRESHOLD}+")
+    print(f"  RIOT: {RIOT_THRESHOLD}+")
+    print(f"  Branches: {BRANCH_THRESHOLD}+")
+    print(f"  Jumps: {JUMP_THRESHOLD}+")
+    print(f"  Unique opcodes: {INSTRUCTION_VARIETY}+")
+    print(f"  Min score: {MIN_SCORE:.2f}")
+    print()
     
-    # Check GPU
-    print(f"🎮 GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
-    print(f"🎮 Memory: {cp.cuda.runtime.memGetInfo()[1] // 1024**2} MB")
+    # GPU info
+    try:
+        gpu_props = cp.cuda.runtime.getDeviceProperties(0)
+        gpu_name = gpu_props['name'].decode()
+        total_mem = cp.cuda.runtime.memGetInfo()[1] // 1024**2
+        print(f"GPU: {gpu_name}")
+        print(f"Memory: {total_mem:,} MB")
+    except Exception:
+        print("GPU: CuPy device detected")
     
-    # Create output directory
-    output_dir = Path("promising_roms")
+    print("\nInitializing lookup tables...")
+    
+    # Setup
+    output_dir = Path("finite_atari_roms")
     output_dir.mkdir(exist_ok=True)
     
-    # Initialize lookup tables on GPU
-    print("\n🔨 Initializing lookup tables...")
-    valid_lut, tia_lut, branch_lut, jump_lut = create_lookup_tables()
+    lookup_tables = create_lookup_tables()
     
+    # Statistics
     total_generated = 0
     promising_found = 0
     start_time = time.time()
     last_report = start_time
+    best_score_ever = 0.0
+    
+    print("Starting ROM generation...")
+    print("=" * 60)
     
     try:
         while True:
-            # Generate random ROMs on GPU
             batch_start = time.time()
+            
+            # Generate batch of ROMs
             roms = cp.random.randint(0, 256, size=(BATCH_SIZE, ROM_SIZE), dtype=cp.uint8)
             
-            # Analyze on GPU
-            analysis = analyze_roms_gpu(roms, valid_lut, tia_lut, branch_lut, jump_lut)
+            # Analyze ROMs
+            analysis = analyze_roms(roms, lookup_tables)
             
-            # Find promising ROMs
+            # Track best score
+            current_best = float(cp.max(analysis['scores']))
+            if current_best > best_score_ever:
+                best_score_ever = current_best
+            
+            # Check for promising ROMs
             promising_indices = cp.where(analysis['promising'])[0]
             
             if len(promising_indices) > 0:
-                # Copy promising ROMs back to CPU for saving
+                # Save promising ROMs
                 promising_roms = cp.asnumpy(roms[promising_indices])
-                promising_analysis = {k: cp.asnumpy(v[promising_indices]) for k, v in analysis.items()}
+                promising_scores = cp.asnumpy(analysis['scores'][promising_indices])
                 
-                # Save each promising ROM
                 for i in range(len(promising_indices)):
-                    rom_analysis = {k: v[i] for k, v in promising_analysis.items()}
-                    save_promising_rom(promising_roms[i], rom_analysis, promising_found, output_dir)
+                    filename = save_promising_rom(
+                        promising_roms[i], promising_scores[i], promising_found, output_dir
+                    )
                     promising_found += 1
             
             total_generated += BATCH_SIZE
             batch_time = time.time() - batch_start
             
-            # Report progress every 5 seconds
+            # Progress reporting
             current_time = time.time()
-            if current_time - last_report >= 5:
+            if current_time - last_report >= 4:
+                # Get best ROM stats for this batch
+                scores = cp.asnumpy(analysis['scores'])
+                best_idx = np.argmax(scores)
+                best_opcodes = float(analysis['opcode_ratio'][best_idx])
+                best_tia = int(analysis['tia_accesses'][best_idx])
+                best_riot = int(analysis['riot_accesses'][best_idx])
+                best_branches = int(analysis['branch_count'][best_idx])
+                best_jumps = int(analysis['jump_count'][best_idx])
+                
                 elapsed = current_time - start_time
                 rate = total_generated / elapsed
-                success_rate = promising_found / total_generated * 100
+                success_rate = promising_found / total_generated * 100 if total_generated > 0 else 0
                 
-                print(f"\r🔍 Generated: {total_generated:,} | Promising: {promising_found} | "
-                      f"Success: {success_rate:.6f}% | Rate: {rate:,.0f}/sec | "
-                      f"Batch: {batch_time:.1f}s", end="", flush=True)
+                print(f"\rGenerated: {total_generated:,} | Found: {promising_found} | "
+                      f"Success: {success_rate:.8f}% | Rate: {rate:,.0f}/sec | "
+                      f"Best: {best_score_ever:.3f} | "
+                      f"Op:{best_opcodes:.1%} TIA:{best_tia} RIOT:{best_riot} Br:{best_branches} Jmp:{best_jumps}", 
+                      end="", flush=True)
                 
                 last_report = current_time
     
     except KeyboardInterrupt:
         elapsed = time.time() - start_time
-        print(f"\n\n🛑 Stopped after {elapsed:.1f} seconds")
-        print(f"📊 Final stats: {total_generated:,} generated, {promising_found} promising found")
-        print("💾 Check 'promising_roms/' directory for results")
+        rate = total_generated / elapsed
+        success_rate = promising_found / total_generated * 100 if total_generated > 0 else 0
+        
+        print(f"\n\nStopped after {elapsed:.1f} seconds")
+        print(f"Total ROMs generated: {total_generated:,}")
+        print(f"Promising ROMs found: {promising_found}")
+        print(f"Success rate: {success_rate:.8f}%")
+        print(f"Average rate: {rate:,.0f} ROMs/second")
+        print(f"Best score achieved: {best_score_ever:.4f}")
+        print(f"Results saved in: {output_dir}")
 
 if __name__ == "__main__":
     main()
