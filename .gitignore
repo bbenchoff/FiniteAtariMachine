@@ -1,2 +1,4 @@
 possible_roms/*
 !possible_roms/.gitkeep
+real_roms/*
+!real_roms/.gitkeep
