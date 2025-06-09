@@ -2,3 +2,9 @@ possible_roms/*
 !possible_roms/.gitkeep
 real_roms/*
 !real_roms/.gitkeep
+garbage_roms/*
+!garbage_roms/.gitkeep
+Mame/*
+!Mame/.gitkeep
+classifier/*
+!classifier/.gitkeep

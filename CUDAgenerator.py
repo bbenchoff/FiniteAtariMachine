@@ -205,7 +205,7 @@ def main():
     print("\nInitializing lookup tables...")
     
     # Setup
-    output_dir = Path("finite_atari_roms")
+    output_dir = Path("possible_roms")
     output_dir.mkdir(exist_ok=True)
     
     lookup_tables = create_lookup_tables()
