@@ -2,7 +2,7 @@
 
 **Finding Atari Games in Randomly Generated Data**
 
-**[Read the full blog post](https://bbenchoff.github.io/pages/FiniteAtari.html)**
+[📖 Read the full blog post](https://bbenchoff.github.io/pages/FiniteAtari.html)
 
 This project generated around 30 billion individual 4kB files of random data, filtered them through GPU-accelerated heuristics, and discovered actual playable Atari 2600 games. This answers a question no one asked: What if I shove a billion monkeys in a GPU and asked them to write a game for the Atari 2600?
 
@@ -17,6 +17,31 @@ Out of approximately **30 billion** randomly generated ROMs:
 - 16 produced static video output  
 - 11 showed dynamic/animated behavior
 - 1 ROM (`51014`) actually responds to joystick input like a real game
+
+### Visual Discoveries
+
+Here are some of the most interesting visual outputs discovered from randomly generated ROMs:
+
+<div align="center">
+
+| ROM 51014 - Interactive Game | Scrolling Bars | Columnar Glitch Art |
+|:---:|:---:|:---:|
+| ![ROM 51014](images/ActualGame2.gif) | ![Scrolling bars](images/FiniteAtari1.gif) | ![Columnar patterns](images/FiniteAtari2.gif) |
+| *Responds to joystick input* | *Dynamic horizontal movement* | *Patterned glitch effects* |
+
+| Geometric Blocks | Corrupt Scanlines | Structured Ladders |
+|:---:|:---:|:---:|
+| ![Geometric blocks](images/FiniteAtari3.gif) | ![Scanline corruption](images/FiniteAtari4.gif) | ![Ladder patterns](images/FiniteAtari5.gif) |
+| *Moving black rectangles* | *Constant flicker with structure* | *Weirdly ordered patterns* |
+
+| Complex Patterns | Architectural Elements |
+|:---:|:---:|
+| ![Complex patterns](images/1.png) | ![Architectural](images/2.png) |
+| *Multi-colored geometric forms* | *Building-like structures* |
+
+</div>
+
+Each of these images represents a ROM that was generated from completely random data, yet produces coherent visual output when run on an Atari 2600 emulator.
 
 ## Requirements
 
@@ -139,3 +164,5 @@ as the name is changed.
  1. Anyone who complains about this license is a nerd.
 
 ---
+
+*"What I'm doing is not the Infinite Monkey Theorem. I'm not asking monkeys to produce the works of Shakespeare, I'm asking them to produce any work."*
