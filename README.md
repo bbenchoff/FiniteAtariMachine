@@ -143,6 +143,7 @@ This is primarily a research/art project, but improvements to the heuristics, pe
 
 ## License
 
+```
            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
                     MODIFIED FOR NERDS 
                    Version 3, April 2025
@@ -157,3 +158,4 @@ as the name is changed.
  0. You just DO WHAT THE FUCK YOU WANT TO.
 
  1. Anyone who complains about this license is a nerd.
+```
