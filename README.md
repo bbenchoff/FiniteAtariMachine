@@ -157,7 +157,3 @@ as the name is changed.
  0. You just DO WHAT THE FUCK YOU WANT TO.
 
  1. Anyone who complains about this license is a nerd.
-
----
-
-*"What I'm doing is not the Infinite Monkey Theorem. I'm not asking monkeys to produce the works of Shakespeare, I'm asking them to produce any work."*
